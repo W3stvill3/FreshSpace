@@ -1,41 +1,95 @@
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
-import { exec } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import Database from 'better-sqlite3';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 // PayFast Sandbox Credentials
-const PAYFAST_MERCHANT_ID = '10000100';
-const PAYFAST_MERCHANT_KEY = '46f0cd694581a';
+const PAYFAST_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '10000100';
+const PAYFAST_MERCHANT_KEY = process.env.PAYFAST_MERCHANT_KEY || '46f0cd694581a';
 const PAYFAST_URL = 'https://sandbox.payfast.co.za/eng/process';
-const BASE_URL = 'http://localhost:5173'; // Assuming Vite dev server
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 app.use(cors());
 app.use(morgan('dev'));
 app.use(express.json());
 
-const query = (sql) => {
-  return new Promise((resolve, reject) => {
-    const escapedSql = sql.replace(/"/g, '\\"');
-    exec(`team-db "${escapedSql}"`, (error, stdout, stderr) => {
-      if (error) {
-        reject(error);
-        return;
+// SQLite setup - path via env var so it works in any environment
+const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'freshspace.db');
+const db = new Database(dbPath);
+db.pragma('journal_mode = WAL');
+
+// Auto-create tables + seed on first run
+db.exec(`
+  CREATE TABLE IF NOT EXISTS services (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+    description TEXT, price REAL NOT NULL, category TEXT NOT NULL,
+    add_on_parent_id INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL, phone TEXT, address TEXT,
+    segment TEXT NOT NULL CHECK (segment IN ('residential','host','student'))
+  );
+  CREATE TABLE IF NOT EXISTS cleaners (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL, phone TEXT, skills TEXT,
+    max_distance_km REAL
+  );
+  CREATE TABLE IF NOT EXISTS cleaner_availability (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cleaner_id INTEGER NOT NULL,
+    day_of_week INTEGER NOT NULL, start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    FOREIGN KEY (cleaner_id) REFERENCES cleaners(id)
+  );
+  CREATE TABLE IF NOT EXISTS bookings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL,
+    cleaner_id INTEGER, service_id INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','confirmed','completed','cancelled')),
+    booking_date TEXT NOT NULL, booking_time TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL, address TEXT NOT NULL, notes TEXT,
+    payment_id TEXT, payment_status TEXT,
+    FOREIGN KEY (client_id) REFERENCES clients(id),
+    FOREIGN KEY (cleaner_id) REFERENCES cleaners(id),
+    FOREIGN KEY (service_id) REFERENCES services(id)
+  );
+  CREATE TABLE IF NOT EXISTS sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id INTEGER NOT NULL,
+    revenue REAL NOT NULL, commission REAL NOT NULL,
+    date_recorded TEXT NOT NULL,
+    FOREIGN KEY (booking_id) REFERENCES bookings(id)
+  );
+`);
+
+const serviceCount = db.prepare('SELECT COUNT(*) as c FROM services').get();
+if (serviceCount.c === 0) {
+  const seed = db.transaction(() => {
+    db.prepare(`INSERT INTO services (name, description, price, category) VALUES
+      ('Standard Clean', 'Full home cleaning service', 35, 'cleaning'),
+      ('Deep Clean', 'Thorough deep cleaning of your space', 60, 'cleaning'),
+      ('Laundry', 'Wash, dry, fold, and iron', 25, 'laundry'),
+      ('Student Clean', 'Quick and affordable student room clean', 20, 'student'),
+      ('Linen Change', 'Fresh bed linens and towels', 15, 'add-on')
+    `).run();
+    db.prepare(`INSERT INTO cleaners (name, email, phone, skills, max_distance_km) VALUES
+      ('Alice Cleaner', 'alice@cleaners.com', '987654321', 'cleaning, laundry', 10),
+      ('Bob Cleaner', 'bob@cleaners.com', '123456789', 'cleaning, student', 15)
+    `).run();
+    const ins = db.prepare('INSERT INTO cleaner_availability (cleaner_id, day_of_week, start_time, end_time) VALUES (?, ?, ?, ?)');
+    for (let c = 1; c <= 2; c++) {
+      for (let d = 1; d <= 5; d++) {
+        ins.run(c, d, c === 1 ? '09:00' : '08:00', c === 1 ? '17:00' : '16:00');
       }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch (err) {
-        if (stdout.trim() === '[]' || stdout.trim() === '') {
-          resolve([]);
-        } else {
-          reject(new Error('Failed to parse database output: ' + stdout));
-        }
-      }
-    });
+    }
   });
-};
+  seed();
+  console.log('Database seeded with sample data');
+}
 
 const addMinutes = (time, mins) => {
   const [h, m] = time.split(':').map(Number);
@@ -44,219 +98,174 @@ const addMinutes = (time, mins) => {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 };
 
-app.get('/api/available-slots', async (req, res) => {
+// API Routes
+app.get('/api/services', (req, res) => {
+  try { res.json(db.prepare('SELECT * FROM services').all()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/cleaners', (req, res) => {
+  try { res.json(db.prepare('SELECT * FROM cleaners').all()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/available-slots', (req, res) => {
   const { date, service_id } = req.query;
   if (!date) return res.status(400).json({ error: 'Missing date' });
-
   try {
     const d = new Date(date);
     let dayOfWeek = d.getDay();
     if (dayOfWeek === 0) dayOfWeek = 7;
 
-    const availableCleaners = await query(`
-      SELECT c.*, ca.start_time, ca.end_time 
-      FROM cleaners c 
-      JOIN cleaner_availability ca ON c.id = ca.cleaner_id 
-      WHERE ca.day_of_week = ${dayOfWeek}
-    `);
+    const availableCleaners = db.prepare(`
+      SELECT c.*, ca.start_time, ca.end_time FROM cleaners c
+      JOIN cleaner_availability ca ON c.id = ca.cleaner_id
+      WHERE ca.day_of_week = ?
+    `).all(dayOfWeek);
 
-    const existingBookings = await query(`
-      SELECT cleaner_id, booking_time, duration_minutes 
-      FROM bookings 
-      WHERE booking_date = '${date}' AND status != 'cancelled'
-    `);
+    const existingBookings = db.prepare(`
+      SELECT cleaner_id, booking_time, duration_minutes FROM bookings
+      WHERE booking_date = ? AND status != 'cancelled'
+    `).all(date);
 
-    const slots = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"];
-    const availableSlots = slots.filter(time => {
-      return availableCleaners.some(cleaner => {
+    const slots = ["09:00","10:00","11:00","12:00","13:00","14:00","15:00"];
+    const availableSlots = slots.filter(time =>
+      availableCleaners.some(cleaner => {
         if (time < cleaner.start_time || time >= cleaner.end_time) return false;
-        
-        const isBooked = existingBookings.some(booking => {
+        return !existingBookings.some(booking => {
           if (booking.cleaner_id !== cleaner.id) return false;
-          const bStart = booking.booking_time;
-          const bEnd = addMinutes(bStart, booking.duration_minutes);
-          return (time >= bStart && time < bEnd);
+          const bEnd = addMinutes(booking.booking_time, booking.duration_minutes);
+          return time >= booking.booking_time && time < bEnd;
         });
-        return !isBooked;
-      });
-    });
-
+      })
+    );
     res.json(availableSlots);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/payments/notify', async (req, res) => {
+app.post('/api/payments/notify', (req, res) => {
   try {
     const { m_payment_id, payment_status } = req.body;
     if (payment_status === 'COMPLETE') {
-      await query(`UPDATE bookings SET status = 'confirmed', payment_status = 'COMPLETE' WHERE id = ${m_payment_id}`);
+      db.prepare("UPDATE bookings SET status = 'confirmed', payment_status = 'COMPLETE' WHERE id = ?").run(m_payment_id);
     } else {
-      await query(`UPDATE bookings SET payment_status = '${payment_status}' WHERE id = ${m_payment_id}`);
+      db.prepare('UPDATE bookings SET payment_status = ? WHERE id = ?').run(payment_status, m_payment_id);
     }
     res.sendStatus(200);
-  } catch (err) {
-    res.sendStatus(500);
-  }
+  } catch { res.sendStatus(500); }
 });
 
-app.post('/api/assign-cleaner', async (req, res) => {
+app.post('/api/assign-cleaner', (req, res) => {
   const { booking_id } = req.body;
   if (!booking_id) return res.status(400).json({ error: 'Missing booking_id' });
-
   try {
-    const bookings = await query(`
-      SELECT b.*, s.category 
-      FROM bookings b 
-      JOIN services s ON b.service_id = s.id 
-      WHERE b.id = ${booking_id}
-    `);
-    if (bookings.length === 0) return res.status(404).json({ error: 'Booking not found' });
-    const booking = bookings[0];
+    const booking = db.prepare(`
+      SELECT b.*, s.category FROM bookings b JOIN services s ON b.service_id = s.id WHERE b.id = ?
+    `).get(booking_id);
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
 
     const d = new Date(booking.booking_date);
     let dayOfWeek = d.getDay();
     if (dayOfWeek === 0) dayOfWeek = 7;
 
-    const availableCleaners = await query(`
-      SELECT c.*, ca.start_time, ca.end_time 
-      FROM cleaners c 
-      JOIN cleaner_availability ca ON c.id = ca.cleaner_id 
-      WHERE ca.day_of_week = ${dayOfWeek}
-      AND c.skills LIKE '%${booking.category}%'
-    `);
+    const availableCleaners = db.prepare(`
+      SELECT c.*, ca.start_time, ca.end_time FROM cleaners c
+      JOIN cleaner_availability ca ON c.id = ca.cleaner_id
+      WHERE ca.day_of_week = ? AND c.skills LIKE ?
+    `).all(dayOfWeek, `%${booking.category}%`);
 
-    const existingBookings = await query(`
-      SELECT cleaner_id, booking_time, duration_minutes 
-      FROM bookings 
-      WHERE booking_date = '${booking.booking_date}' AND status != 'cancelled' AND cleaner_id IS NOT NULL
-    `);
+    const existingBookings = db.prepare(`
+      SELECT cleaner_id, booking_time, duration_minutes FROM bookings
+      WHERE booking_date = ? AND status != 'cancelled' AND cleaner_id IS NOT NULL
+    `).all(booking.booking_date);
 
     const matchingCleaner = availableCleaners.find(cleaner => {
       const bookingEnd = addMinutes(booking.booking_time, booking.duration_minutes);
       if (booking.booking_time < cleaner.start_time || bookingEnd > cleaner.end_time) return false;
-
-      const isOverlapping = existingBookings.some(eb => {
+      return !existingBookings.some(eb => {
         if (eb.cleaner_id !== cleaner.id) return false;
         const ebEnd = addMinutes(eb.booking_time, eb.duration_minutes);
-        return (booking.booking_time < ebEnd && bookingEnd > eb.booking_time);
+        return booking.booking_time < ebEnd && bookingEnd > eb.booking_time;
       });
-      return !isOverlapping;
     });
 
     if (matchingCleaner) {
-      await query(`UPDATE bookings SET cleaner_id = ${matchingCleaner.id} WHERE id = ${booking_id}`);
+      db.prepare('UPDATE bookings SET cleaner_id = ? WHERE id = ?').run(matchingCleaner.id, booking_id);
       res.json({ success: true, cleaner: matchingCleaner });
     } else {
       res.status(404).json({ error: 'No available cleaner found' });
     }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ... existing endpoints ...
-app.get('/api/services', async (req, res) => {
-  try {
-    const services = await query('SELECT * FROM services');
-    res.json(services);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/cleaners', async (req, res) => {
-  try {
-    const cleaners = await query('SELECT * FROM cleaners');
-    res.json(cleaners);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/bookings', async (req, res) => {
+app.post('/api/bookings', (req, res) => {
   try {
     const { client_name, client_email, client_phone, address, service_id, booking_date, booking_time, notes } = req.body;
-    let clients = await query(`SELECT id FROM clients WHERE email = '${client_email}'`);
+    let client = db.prepare('SELECT id FROM clients WHERE email = ?').get(client_email);
     let client_id;
-    if (clients.length > 0) {
-      client_id = clients[0].id;
+    if (client) {
+      client_id = client.id;
     } else {
-      await query(`INSERT INTO clients (name, email, phone, address, segment) VALUES ('${client_name}', '${client_email}', '${client_phone}', '${address}', 'residential')`);
-      clients = await query(`SELECT id FROM clients WHERE email = '${client_email}'`);
-      client_id = clients[0].id;
+      const info = db.prepare("INSERT INTO clients (name, email, phone, address, segment) VALUES (?, ?, ?, ?, 'residential')").run(client_name, client_email, client_phone, address);
+      client_id = info.lastInsertRowid;
     }
-    const duration = 120; 
-    await query(`INSERT INTO bookings (client_id, service_id, status, booking_date, booking_time, duration_minutes, address, notes) VALUES (${client_id}, ${service_id}, 'pending', '${booking_date}', '${booking_time}', ${duration}, '${address}', '${notes || ''}')`);
-    const newBookings = await query(`SELECT id FROM bookings WHERE client_id = ${client_id} ORDER BY id DESC LIMIT 1`);
-    const bookingId = newBookings[0].id;
+    const duration = 120;
+    const info = db.prepare("INSERT INTO bookings (client_id, service_id, status, booking_date, booking_time, duration_minutes, address, notes) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)").run(client_id, service_id, booking_date, booking_time, duration, address, notes || '');
+    const bookingId = info.lastInsertRowid;
+    const service = db.prepare('SELECT name, price FROM services WHERE id = ?').get(service_id);
 
-    // Get service details for PayFast
-    const serviceDetails = await query(`SELECT name, price FROM services WHERE id = ${service_id}`);
-    const service = serviceDetails[0];
-
-    // Prepare PayFast Data
     const payfastData = {
       merchant_id: PAYFAST_MERCHANT_ID,
       merchant_key: PAYFAST_MERCHANT_KEY,
       return_url: `${BASE_URL}/confirmation?bookingId=${bookingId}`,
       cancel_url: `${BASE_URL}/booking?serviceId=${service_id}`,
-      notify_url: `${BASE_URL}/api/payments/notify`, // PayFast ITN webhook
+      notify_url: `${BASE_URL}/api/payments/notify`,
       name_first: client_name.split(' ')[0],
       name_last: client_name.split(' ').slice(1).join(' ') || 'Customer',
       email_address: client_email,
-      m_payment_id: bookingId,
+      m_payment_id: String(bookingId),
       amount: service.price.toFixed(2),
       item_name: `FreshSpace: ${service.name}`
     };
-
-    res.json({ success: true, bookingId, payfastData, payfastUrl: PAYFAST_URL });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ success: true, bookingId: Number(bookingId), payfastData, payfastUrl: PAYFAST_URL });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/bookings/:id', async (req, res) => {
+app.get('/api/bookings/:id', (req, res) => {
   try {
-    const booking = await query(`SELECT b.*, s.name as service_name FROM bookings b JOIN services s ON b.service_id = s.id WHERE b.id = ${req.params.id}`);
-    if (booking.length === 0) return res.status(404).json({ error: 'Booking not found' });
-    res.json(booking[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const booking = db.prepare('SELECT b.*, s.name as service_name FROM bookings b JOIN services s ON b.service_id = s.id WHERE b.id = ?').get(req.params.id);
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+    res.json(booking);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Dashboard Data API
-app.get('/api/admin/stats', async (req, res) => {
+app.get('/api/admin/stats', (req, res) => {
   try {
-    const totalRevenue = await query('SELECT SUM(revenue) as total FROM sales');
-    const bookingsByWeek = await query("SELECT strftime('%W', booking_date) as week, COUNT(*) as count FROM bookings GROUP BY week");
-    const revenueBySegment = await query("SELECT c.segment, SUM(s.revenue) as revenue FROM sales s JOIN bookings b ON s.booking_id = b.id JOIN clients c ON b.client_id = c.id GROUP BY c.segment");
-    const repeatRate = await query("SELECT (SELECT COUNT(*) FROM (SELECT client_id FROM bookings GROUP BY client_id HAVING COUNT(*) > 1)) * 100.0 / COUNT(DISTINCT client_id) as rate FROM bookings");
-    const avgOrderValue = await query("SELECT AVG(revenue) as avg FROM sales");
-    
+    const totalRevenue = db.prepare('SELECT COALESCE(SUM(revenue),0) as total FROM sales').get();
+    const bookingsByWeek = db.prepare("SELECT strftime('%W', booking_date) as week, COUNT(*) as count FROM bookings GROUP BY week").all();
+    const revenueBySegment = db.prepare("SELECT c.segment, COALESCE(SUM(s.revenue),0) as revenue FROM sales s JOIN bookings b ON s.booking_id = b.id JOIN clients c ON b.client_id = c.id GROUP BY c.segment").all();
+    const repeatData = db.prepare("SELECT (SELECT COUNT(*) FROM (SELECT client_id FROM bookings GROUP BY client_id HAVING COUNT(*) > 1)) * 100.0 / MAX(COUNT(DISTINCT client_id),1) as rate FROM bookings").get();
+    const avgOrderValue = db.prepare('SELECT COALESCE(AVG(revenue),0) as avg FROM sales').get();
+
     res.json({
-      totalRevenue: totalRevenue[0]?.total || 0,
+      totalRevenue: totalRevenue.total,
       bookingsByWeek,
       revenueBySegment,
-      repeatRate: repeatRate[0]?.rate || 0,
-      avgOrderValue: avgOrderValue[0]?.avg || 0
+      repeatRate: repeatData?.rate || 0,
+      avgOrderValue: avgOrderValue.avg
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/admin/tasks', async (req, res) => {
-  try {
-    const tasks = await query('SELECT * FROM tasks');
-    res.json(tasks);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+// Serve frontend in production
+const distPath = path.join(__dirname, '..', 'dist');
+app.use(express.static(distPath));
+app.get('/{*path}', (req, res) => {
+  if (!req.path.startsWith('/api')) {
+    res.sendFile(path.join(distPath, 'index.html'));
   }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on http://0.0.0.0:${PORT}`);
+  console.log(`FreshSpace running on http://0.0.0.0:${PORT}`);
 });

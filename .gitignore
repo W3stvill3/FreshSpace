@@ -3,3 +3,5 @@ node_modules/
 nohup.out
 .DS_Store
 *.log
+freshspace.db
+dist/
